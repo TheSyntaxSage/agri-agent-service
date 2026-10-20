@@ -87,6 +87,8 @@ class FeedbackCreate(CamelModel):
 class FeedbackRead(FeedbackCreate):
     id: int
     created_at: datetime
+    tenant_id: str
+    user_id: str
 
 
 class ErrorMetric(CamelModel):

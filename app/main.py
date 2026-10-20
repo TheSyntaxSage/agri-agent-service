@@ -5,14 +5,16 @@ from contextlib import asynccontextmanager
 from statistics import fmean
 from typing import Any
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.auth import require_identity
 from app.config import Settings, get_settings
-from app.database import FeedbackRecord, create_session_factory
-from app.java_client import JavaApiUnavailable
+from app.database import FeedbackRecord, FeedbackScope, create_session_factory
+from app.java_client import JavaApiUnavailable, JavaInternalApiClient
+from app.llm_client import LlmIntentClassifier
 from app.models import (
     DecisionOutput,
     DecisionRequest,
@@ -34,8 +36,24 @@ def create_app(settings: Settings | None = None, workflow: DecisionWorkflow | No
     async def lifespan(app: FastAPI):
         app.state.settings = app_settings
         app.state.session_factory = create_session_factory(app_settings)
-        app.state.workflow = workflow or DecisionWorkflow(app_settings)
-        yield
+        if workflow is not None:
+            app.state.workflow = workflow
+            yield
+            return
+
+        async with httpx.AsyncClient(
+            base_url=app_settings.java_base_url,
+            timeout=app_settings.java_timeout_seconds,
+        ) as java_http_client:
+            java_client = JavaInternalApiClient(app_settings, java_http_client)
+            if not app_settings.llm_enabled:
+                app.state.workflow = DecisionWorkflow(app_settings, java_client)
+                yield
+                return
+            async with httpx.AsyncClient(timeout=app_settings.llm_timeout_seconds) as llm_http_client:
+                classifier = LlmIntentClassifier(app_settings, llm_http_client)
+                app.state.workflow = DecisionWorkflow(app_settings, java_client, classifier)
+                yield
 
     app = FastAPI(title=app_settings.app_name, version="0.1.0", lifespan=lifespan)
 
@@ -73,8 +91,8 @@ def create_app(settings: Settings | None = None, workflow: DecisionWorkflow | No
     async def create_feedback(
         payload: FeedbackCreate,
         db: Session = Depends(get_db),
-        _: IdentityContext = Depends(require_identity),
-    ) -> FeedbackRecord:
+        identity: IdentityContext = Depends(require_identity),
+    ) -> FeedbackRead:
         record = FeedbackRecord(
             trace_id=payload.trace_id,
             intent=payload.intent.value,
@@ -84,27 +102,39 @@ def create_app(settings: Settings | None = None, workflow: DecisionWorkflow | No
             comment=payload.comment,
         )
         db.add(record)
+        db.flush()
+        db.add(FeedbackScope(feedback_id=record.id, tenant_id=identity.tenant_id, user_id=identity.user_id))
         db.commit()
         db.refresh(record)
-        return record
+        return FeedbackRead.model_validate({
+            **record.__dict__, "tenant_id": identity.tenant_id, "user_id": identity.user_id
+        })
 
     @app.get("/api/v1/feedback", response_model=list[FeedbackRead], response_model_by_alias=True)
     async def list_feedback(
         trace_id: str | None = Query(default=None),
         db: Session = Depends(get_db),
-        _: IdentityContext = Depends(require_identity),
-    ) -> list[FeedbackRecord]:
-        statement = select(FeedbackRecord).order_by(FeedbackRecord.id.desc())
+        identity: IdentityContext = Depends(require_identity),
+    ) -> list[FeedbackRead]:
+        statement = (select(FeedbackRecord, FeedbackScope)
+                     .join(FeedbackScope, FeedbackScope.feedback_id == FeedbackRecord.id)
+                     .where(FeedbackScope.tenant_id == identity.tenant_id)
+                     .order_by(FeedbackRecord.id.desc()))
         if trace_id:
             statement = statement.where(FeedbackRecord.trace_id == trace_id)
-        return list(db.scalars(statement).all())
+        return [FeedbackRead.model_validate({
+            **record.__dict__, "tenant_id": scope.tenant_id, "user_id": scope.user_id
+        }) for record, scope in db.execute(statement).all()]
 
     @app.get("/api/v1/error-analysis", response_model=ErrorAnalysis, response_model_by_alias=True)
     async def error_analysis(
         db: Session = Depends(get_db),
-        _: IdentityContext = Depends(require_identity),
+        identity: IdentityContext = Depends(require_identity),
     ) -> ErrorAnalysis:
-        records = list(db.scalars(select(FeedbackRecord)).all())
+        records = list(db.scalars(
+            select(FeedbackRecord).join(FeedbackScope, FeedbackScope.feedback_id == FeedbackRecord.id)
+            .where(FeedbackScope.tenant_id == identity.tenant_id)
+        ).all())
         grouped: dict[str, list[FeedbackRecord]] = defaultdict(list)
         for record in records:
             grouped[record.intent].append(record)
@@ -133,4 +163,3 @@ def create_app(settings: Settings | None = None, workflow: DecisionWorkflow | No
 
 
 app = create_app()
-

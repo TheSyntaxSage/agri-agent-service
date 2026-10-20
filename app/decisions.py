@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from math import ceil
+from collections import defaultdict
+from datetime import date
+from math import ceil, isfinite
 from statistics import fmean
 from typing import Any, Callable
 
@@ -14,12 +16,26 @@ def _number(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _valid_number(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    try:
+        return isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
 def _sales(context: dict[str, Any]) -> list[float]:
-    values: list[float] = []
+    daily: dict[date, float] = defaultdict(float)
     for row in context.get("salesHistory", []):
-        quantity = row.get("quantity", 0) if isinstance(row, dict) else row
-        values.append(max(0.0, _number(quantity)))
-    return values
+        if not isinstance(row, dict) or not isinstance(row.get("date"), str):
+            continue
+        try:
+            sales_date = date.fromisoformat(row["date"])
+        except ValueError:
+            continue
+        daily[sales_date] += max(0.0, _number(row.get("quantityKg", row.get("quantity"))))
+    return [daily[sales_date] for sales_date in sorted(daily)][-30:]
 
 
 def _forecast(context: dict[str, Any]) -> tuple[float, float, list[float]]:
@@ -41,26 +57,69 @@ def _base_evidence(context: dict[str, Any], demo: bool) -> list[Evidence]:
     return [Evidence(source="java_internal_api" if not demo else "test_demo_fixture", description="分析对象", value=product, demo_data=demo)]
 
 
+def _insufficient(context: dict[str, Any], demo: bool, missing: list[str]) -> dict[str, Any]:
+    description = "、".join(missing)
+    return {
+        "recommendation": f"数据不足，不能生成经营建议：缺少{description}。请补齐后重新分析。",
+        "evidence": _base_evidence(context, demo),
+        "calculations": [],
+        "risks": [Risk(level="high", description=f"缺少{description}，任何数值结论都可能误导", mitigation="补齐真实数据并重新发起人工分析")],
+        "confidence": 0.0,
+        "requires_human_confirmation": True,
+    }
+
+
+def _missing_sales_inputs(context: dict[str, Any], include_stock: bool = False) -> list[str]:
+    missing: list[str] = []
+    if not context.get("productName"):
+        missing.append("明确商品")
+    if not _sales(context):
+        missing.append("按日汇总销量")
+    else:
+        dates = []
+        for row in context.get("salesHistory", []):
+            try:
+                dates.append(date.fromisoformat(row["date"]))
+            except (ValueError, TypeError, KeyError):
+                continue
+        dates = sorted(set(dates))[-7:]
+        if any((right - left).days != 1 for left, right in zip(dates, dates[1:])):
+            missing.append("连续自然日销量（缺失日期不能当作相邻日期或零销量）")
+    if include_stock and not _valid_number(context.get("currentStock")):
+        missing.append("当前库存")
+    return missing
+
+
 def sales_forecast(context: dict[str, Any], demo: bool) -> dict[str, Any]:
+    missing = _missing_sales_inputs(context)
+    if context.get("forecastDays") is None:
+        missing.append("预测天数")
+    if missing:
+        return _insufficient(context, demo, missing)
     daily, trend, window = _forecast(context)
     days = max(1, int(_number(context.get("forecastDays"), 7)))
     total = sum(max(0.0, daily + trend * index) for index in range(days))
     volatility = (max(window) - min(window)) / max(fmean(window), 1.0) if window else 1.0
     confidence = max(0.35, min(0.95, 0.92 - volatility * 0.5 - (0.15 if len(window) < 7 else 0)))
     return {
-        "recommendation": f"未来{days}天预计销量约 {total:.0f}，建议按日均 {total / days:.1f} 安排供给。",
+        "recommendation": f"未来{days}天预计销量约 {total:.1f} kg，建议以日均 {total / days:.1f} kg 作为人工排产参考。",
         "evidence": _base_evidence(context, demo) + [Evidence(source="sales_history", description="移动窗口销量", value=window, demo_data=demo)],
         "calculations": [
-            Calculation(metric="next_day_forecast", formula="7日移动平均 + 窗口日趋势", result=round(daily, 2), unit="件/天"),
-            Calculation(metric="period_forecast", formula="未来各日趋势外推值之和", result=round(total, 2), unit="件"),
+            Calculation(metric="next_day_forecast", formula="最近7个有销量日期的移动平均 + 日期序列趋势", result=round(daily, 2), unit="kg/天"),
+            Calculation(metric="period_forecast", formula="未来各日趋势外推值之和", result=round(total, 2), unit="kg"),
         ],
         "risks": [Risk(level="medium" if volatility > 0.25 else "low", description="历史销量波动可能降低短期外推准确性", mitigation="结合促销、节假日和订单数据人工复核")],
         "confidence": confidence,
-        "requires_human_confirmation": False,
+        "requires_human_confirmation": True,
     }
 
 
 def inventory_coverage(context: dict[str, Any], demo: bool) -> dict[str, Any]:
+    missing = _missing_sales_inputs(context, include_stock=True)
+    if context.get("leadTimeDays") is None or context.get("safetyStockDays") is None:
+        missing.append("提前期与安全库存天数")
+    if missing:
+        return _insufficient(context, demo, missing)
     daily, _, _ = _forecast(context)
     stock = max(0.0, _number(context.get("currentStock")))
     coverage = stock / daily if daily > 0 else 999.0
@@ -71,7 +130,7 @@ def inventory_coverage(context: dict[str, Any], demo: bool) -> dict[str, Any]:
     if daily <= 0:
         recommendation = "缺少有效销量数据，无法可靠计算库存覆盖天数。"
     elif gap > 0:
-        recommendation = f"库存约覆盖 {coverage:.1f} 天，低于提前期与安全期合计 {lead + safety:.1f} 天，建议补充至少 {ceil(gap)} 件。"
+        recommendation = f"库存约覆盖 {coverage:.1f} 天，低于提前期与安全期合计 {lead + safety:.1f} 天，建议人工核对至少 {ceil(gap)} kg 的补货缺口。"
     else:
         recommendation = f"库存约覆盖 {coverage:.1f} 天，当前高于补货触发线，可继续监控。"
     return {
@@ -79,15 +138,20 @@ def inventory_coverage(context: dict[str, Any], demo: bool) -> dict[str, Any]:
         "evidence": _base_evidence(context, demo) + [Evidence(source="inventory", description="当前可用库存", value=stock, demo_data=demo)],
         "calculations": [
             Calculation(metric="coverage_days", formula="当前库存 / 预测日销量", result=round(coverage, 2), unit="天"),
-            Calculation(metric="reorder_gap", formula="日销量×(提前期+安全期)-库存", result=round(gap, 2), unit="件"),
+            Calculation(metric="reorder_gap", formula="日销量×(提前期+安全期)-库存", result=round(gap, 2), unit="kg"),
         ],
         "risks": [Risk(level="high" if gap > 0 else "low", description="供应提前期或销量突增会改变覆盖水平", mitigation="在关键品类设置动态安全库存")],
         "confidence": 0.86 if daily > 0 else 0.35,
-        "requires_human_confirmation": False,
+        "requires_human_confirmation": True,
     }
 
 
 def stock_issue(context: dict[str, Any], demo: bool) -> dict[str, Any]:
+    missing = _missing_sales_inputs(context, include_stock=True)
+    if context.get("leadTimeDays") is None or context.get("shelfLifeDays") is None:
+        missing.append("提前期与保鲜期")
+    if missing:
+        return _insufficient(context, demo, missing)
     daily, _, _ = _forecast(context)
     stock = max(0.0, _number(context.get("currentStock")))
     coverage = stock / daily if daily > 0 else 999.0
@@ -106,34 +170,48 @@ def stock_issue(context: dict[str, Any], demo: bool) -> dict[str, Any]:
         "calculations": [Calculation(metric="coverage_days", formula="库存 / 预测日销量", result=round(coverage, 2), unit="天")],
         "risks": [Risk(level=level, description=f"当前{label}", mitigation=rec)],
         "confidence": 0.83,
-        "requires_human_confirmation": shortage,
+        "requires_human_confirmation": True,
     }
 
 
 def purchase_advice(context: dict[str, Any], demo: bool) -> dict[str, Any]:
+    missing = _missing_sales_inputs(context, include_stock=True)
+    if context.get("leadTimeDays") is None or context.get("safetyStockDays") is None:
+        missing.append("提前期与安全库存天数")
+    if missing:
+        return _insufficient(context, demo, missing)
     daily, _, _ = _forecast(context)
     stock = max(0.0, _number(context.get("currentStock")))
     lead = max(0.0, _number(context.get("leadTimeDays"), 3))
     safety = max(0.0, _number(context.get("safetyStockDays"), 2))
     target = daily * (lead + safety)
     quantity = max(0, ceil(target - stock))
-    unit_price = max(0.0, _number(context.get("purchaseUnitPrice", context.get("unitCost", 0))))
-    amount = quantity * unit_price
+    price_value = context.get("purchaseUnitPrice", context.get("unitCost"))
+    unit_price = max(0.0, _number(price_value)) if price_value is not None else None
+    amount = quantity * unit_price if unit_price is not None else None
+    amount_text = f"，按输入单价估算采购额 {amount:.2f} 元" if amount is not None else "；未提供采购单价，不估算金额"
     return {
-        "recommendation": f"建议采购 {quantity} 件，估算采购额 {amount:.2f} 元；执行前核对在途订单和供应商交期。" if quantity else "当前无需新增采购，继续监控库存和预测变化。",
+        "recommendation": f"建议人工核对 {quantity} kg 的采购缺口{amount_text}。确认前须核对当前货盘订单和供应商交期。" if quantity else "当前计算未显示新增采购缺口，仍须人工核对当前货盘订单。",
         "evidence": _base_evidence(context, demo),
         "calculations": [
-            Calculation(metric="purchase_quantity", formula="max(0, 日销量×(提前期+安全期)-库存)", result=quantity, unit="件"),
-            Calculation(metric="purchase_amount", formula="采购数量×采购单价", result=round(amount, 2), unit="元"),
+            Calculation(metric="purchase_quantity", formula="max(0, 日销量×(提前期+安全期)-库存)", result=quantity, unit="kg"),
+            *([Calculation(metric="purchase_amount", formula="采购数量×调用方提供的采购单价", result=round(amount, 2), unit="元")] if amount is not None else []),
         ],
         "risks": [Risk(level="medium", description="重复采购、预测偏差或供应商延期可能造成损失", mitigation="必须与在途采购单及预算联查")],
         "confidence": 0.84,
-        "requires_human_confirmation": quantity > 0,
-        "purchase_amount": amount,
+        "requires_human_confirmation": True,
+        "purchase_amount": amount or 0.0,
     }
 
 
 def harvest_advice(context: dict[str, Any], demo: bool) -> dict[str, Any]:
+    missing = _missing_sales_inputs(context, include_stock=True)
+    if context.get("readyCropQuantity") is None:
+        missing.append("人工确认的可采收量")
+    if context.get("forecastDays") is None or context.get("wasteRate") is None:
+        missing.append("预测天数与损耗率")
+    if missing:
+        return _insufficient(context, demo, missing)
     daily, _, _ = _forecast(context)
     stock = max(0.0, _number(context.get("currentStock")))
     ready = max(0.0, _number(context.get("readyCropQuantity")))
@@ -142,12 +220,12 @@ def harvest_advice(context: dict[str, Any], demo: bool) -> dict[str, Any]:
     need = max(0.0, daily * days - stock)
     gross_harvest = min(ready, need / max(0.01, 1 - waste))
     return {
-        "recommendation": f"建议未来{days}天分批采摘约 {ceil(gross_harvest)} 件，优先按订单锁定量安排，避免一次性采摘。",
+        "recommendation": f"建议未来{days}天人工安排分批采摘约 {ceil(gross_harvest)} kg，优先按订单锁定量复核，避免一次性采摘。",
         "evidence": _base_evidence(context, demo) + [Evidence(source="production", description="当前可采收量", value=ready, demo_data=demo)],
-        "calculations": [Calculation(metric="harvest_quantity", formula="min(可采量, (预测需求-库存)/(1-损耗率))", result=round(gross_harvest, 2), unit="件")],
+        "calculations": [Calculation(metric="harvest_quantity", formula="min(可采量, (预测需求-库存)/(1-损耗率))", result=round(gross_harvest, 2), unit="kg")],
         "risks": [Risk(level="medium", description="成熟度、天气和采后损耗可能改变实际可售量", mitigation="按批次抽检成熟度和损耗率")],
         "confidence": 0.81,
-        "requires_human_confirmation": gross_harvest > 0,
+        "requires_human_confirmation": True,
     }
 
 
@@ -188,8 +266,10 @@ def supplier_match(context: dict[str, Any], demo: bool) -> dict[str, Any]:
 
 def weather_impact(context: dict[str, Any], demo: bool) -> dict[str, Any]:
     weather = context.get("weather", {}) if isinstance(context.get("weather", {}), dict) else {}
-    max_temp = _number(weather.get("maxTemp"), 25)
-    min_temp = _number(weather.get("minTemp"), 15)
+    if not weather or any(not _valid_number(weather.get(key)) for key in ("maxTemp", "minTemp", "rainfallMm", "windKph")):
+        return _insufficient(context, demo, ["真实天气观测或预报"])
+    max_temp = _number(weather.get("maxTemp"))
+    min_temp = _number(weather.get("minTemp"))
     rain = _number(weather.get("rainfallMm"))
     wind = _number(weather.get("windKph"))
     hazards: list[str] = []
@@ -214,7 +294,7 @@ def weather_impact(context: dict[str, Any], demo: bool) -> dict[str, Any]:
         "calculations": [Calculation(metric="weather_risk_score", formula="高温/低温/强降雨/大风阈值计分", result=score, unit="分")],
         "risks": [Risk(level=level, description=recommendation, mitigation="以本地预警和田间实测为准，必要时暂停户外作业")],
         "confidence": 0.78,
-        "requires_human_confirmation": score >= 4,
+        "requires_human_confirmation": True,
     }
 
 
@@ -251,7 +331,10 @@ def planting_advice(context: dict[str, Any], demo: bool) -> dict[str, Any]:
 
 
 def price_profit_sensitivity(context: dict[str, Any], demo: bool) -> dict[str, Any]:
-    price = max(0.01, _number(context.get("basePrice"), 1))
+    required = [key for key in ("basePrice", "unitCost", "baseDemand", "priceElasticity") if not _valid_number(context.get(key))]
+    if required or _number(context.get("basePrice")) <= 0 or _number(context.get("unitCost")) < 0 or _number(context.get("baseDemand")) < 0:
+        return _insufficient(context, demo, ["价格、成本、需求与弹性完整输入"])
+    price = max(0.01, _number(context.get("basePrice")))
     cost = max(0.0, _number(context.get("unitCost")))
     demand = max(0.0, _number(context.get("baseDemand"), 0))
     elasticity = _number(context.get("priceElasticity"), -1)
@@ -283,4 +366,3 @@ ANALYZERS: dict[Intent, Callable[[dict[str, Any], bool], dict[str, Any]]] = {
     Intent.PLANTING_ADVICE: planting_advice,
     Intent.PRICE_PROFIT_SENSITIVITY: price_profit_sensitivity,
 }
-

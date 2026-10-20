@@ -1,14 +1,20 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
-from typing import Any
+import logging
+from typing import Any, TypedDict
 from uuid import uuid4
+
+from langgraph.errors import GraphRecursionError
+from langgraph.graph import END, START, StateGraph
 
 from app.config import Settings
 from app.decisions import ANALYZERS
 from app.demo_data import build_demo_context
 from app.java_client import JavaApiUnavailable, JavaInternalApiClient
+from app.llm_client import LlmIntentClassifier, LlmUnavailable
 from app.models import DecisionOutput, DecisionRequest, IdentityContext, Intent
+
+LOGGER = logging.getLogger(__name__)
 
 
 class WorkflowError(RuntimeError):
@@ -23,40 +29,16 @@ class PermissionDenied(WorkflowError):
     pass
 
 
-Node = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
-
-
-class StateGraph:
-    """Small LangGraph-style directed state workflow, with deterministic nodes."""
-
-    END = "__end__"
-
-    def __init__(self) -> None:
-        self.nodes: dict[str, Node] = {}
-        self.edges: dict[str, str] = {}
-        self.entry_point: str | None = None
-
-    def add_node(self, name: str, node: Node) -> None:
-        self.nodes[name] = node
-
-    def add_edge(self, source: str, target: str) -> None:
-        self.edges[source] = target
-
-    def set_entry_point(self, name: str) -> None:
-        self.entry_point = name
-
-    async def invoke(self, state: dict[str, Any], max_steps: int = 10) -> dict[str, Any]:
-        current = self.entry_point
-        steps = 0
-        while current and current != self.END:
-            if current not in self.nodes:
-                raise WorkflowError(f"Unknown workflow node: {current}")
-            if steps >= max_steps:
-                raise LoopDetected("Workflow exceeded deterministic step limit")
-            state.update(await self.nodes[current](state))
-            current = self.edges.get(current, self.END)
-            steps += 1
-        return state
+class DecisionState(TypedDict, total=False):
+    request: DecisionRequest
+    identity: IdentityContext
+    trace_id: str
+    loop_markers: list[str]
+    intent: Intent
+    context: dict[str, Any]
+    demo: bool
+    analysis: dict[str, Any]
+    output: DecisionOutput
 
 
 INTENT_KEYWORDS: list[tuple[Intent, tuple[str, ...]]] = [
@@ -70,6 +52,18 @@ INTENT_KEYWORDS: list[tuple[Intent, tuple[str, ...]]] = [
     (Intent.INVENTORY_COVERAGE, ("覆盖", "库存天数", "inventory coverage")),
     (Intent.SALES_FORECAST, ("销量", "预测", "需求", "forecast", "sales")),
 ]
+
+ALLOWED_PARAMETERS: dict[Intent, set[str]] = {
+    Intent.SALES_FORECAST: {"productName", "forecastDays"},
+    Intent.INVENTORY_COVERAGE: {"productName", "leadTimeDays", "safetyStockDays"},
+    Intent.STOCK_ISSUE: {"productName", "leadTimeDays", "shelfLifeDays"},
+    Intent.PURCHASE_ADVICE: {"productName", "leadTimeDays", "safetyStockDays", "purchaseUnitPrice"},
+    Intent.HARVEST_ADVICE: {"productName", "forecastDays", "readyCropQuantity", "wasteRate"},
+    Intent.SUPPLIER_MATCH: {"productName"},
+    Intent.WEATHER_IMPACT: {"productName", "weather"},
+    Intent.PLANTING_ADVICE: {"productName"},
+    Intent.PRICE_PROFIT_SENSITIVITY: {"productName", "basePrice", "unitCost", "baseDemand", "priceElasticity"},
+}
 
 
 def recognize_intent(query: str) -> Intent:
@@ -87,31 +81,41 @@ def recognize_intent(query: str) -> Intent:
 class DecisionWorkflow:
     LOOP_MARKER = "agri-agent-service:decision"
 
-    def __init__(self, settings: Settings, java_client: JavaInternalApiClient | None = None):
+    def __init__(
+        self,
+        settings: Settings,
+        java_client: JavaInternalApiClient,
+        intent_classifier: LlmIntentClassifier | None = None,
+    ):
         self.settings = settings
-        self.java_client = java_client or JavaInternalApiClient(settings)
-        self.graph = StateGraph()
-        self.graph.add_node("guard", self._guard)
-        self.graph.add_node("recognize", self._recognize)
-        self.graph.add_node("authorize", self._authorize)
-        self.graph.add_node("fetch_context", self._fetch_context)
-        self.graph.add_node("analyze", self._analyze)
-        self.graph.add_node("finalize", self._finalize)
-        self.graph.set_entry_point("guard")
-        self.graph.add_edge("guard", "recognize")
-        self.graph.add_edge("recognize", "authorize")
-        self.graph.add_edge("authorize", "fetch_context")
-        self.graph.add_edge("fetch_context", "analyze")
-        self.graph.add_edge("analyze", "finalize")
-        self.graph.add_edge("finalize", StateGraph.END)
+        self.java_client = java_client
+        self.intent_classifier = intent_classifier
+        graph_builder = StateGraph(DecisionState)
+        graph_builder.add_node("guard", self._guard)
+        graph_builder.add_node("recognize", self._recognize)
+        graph_builder.add_node("authorize", self._authorize)
+        graph_builder.add_node("fetch_context", self._fetch_context)
+        graph_builder.add_node("analyze", self._analyze)
+        graph_builder.add_node("finalize", self._finalize)
+        graph_builder.add_edge(START, "guard")
+        graph_builder.add_edge("guard", "recognize")
+        graph_builder.add_edge("recognize", "authorize")
+        graph_builder.add_edge("authorize", "fetch_context")
+        graph_builder.add_edge("fetch_context", "analyze")
+        graph_builder.add_edge("analyze", "finalize")
+        graph_builder.add_edge("finalize", END)
+        self.graph = graph_builder.compile(name="agri-decision-workflow")
 
     async def run(self, request: DecisionRequest, identity: IdentityContext) -> DecisionOutput:
         trace_id = request.trace_id or str(uuid4())
-        state: dict[str, Any] = {"request": request, "identity": identity, "trace_id": trace_id}
-        result = await self.graph.invoke(state)
+        state = DecisionState(request=request, identity=identity, trace_id=trace_id)
+        try:
+            result = await self.graph.ainvoke(state, config={"recursion_limit": 10})
+        except GraphRecursionError as exc:
+            raise LoopDetected("Workflow exceeded LangGraph recursion limit") from exc
         return result["output"]
 
-    async def _guard(self, state: dict[str, Any]) -> dict[str, Any]:
+    async def _guard(self, state: DecisionState) -> dict[str, Any]:
         request: DecisionRequest = state["request"]
         if self.LOOP_MARKER in request.loop_markers:
             raise LoopDetected("Request already contains this agent's loop marker")
@@ -119,12 +123,41 @@ class DecisionWorkflow:
             raise LoopDetected("Maximum agent hop count reached")
         return {"loop_markers": [*request.loop_markers, self.LOOP_MARKER]}
 
-    async def _recognize(self, state: dict[str, Any]) -> dict[str, Any]:
+    async def _recognize_intent(self, query: str) -> Intent:
+        if query.strip() and self.intent_classifier is not None:
+            try:
+                intent = await self.intent_classifier.classify(query)
+            except LlmUnavailable as exc:
+                LOGGER.warning("Intent classification fell back to keyword rules: %s", exc)
+            else:
+                if intent != Intent.AUTO:
+                    return intent
+        return recognize_intent(query)
+
+    async def _recognize(self, state: DecisionState) -> dict[str, Any]:
         request: DecisionRequest = state["request"]
-        intent = recognize_intent(request.query) if request.intent == Intent.AUTO else request.intent
+        intent = await self._recognize_intent(request.query) if request.intent == Intent.AUTO else request.intent
+        unknown = sorted(set(request.parameters) - ALLOWED_PARAMETERS[intent])
+        if unknown:
+            raise WorkflowError(f"Unsupported parameters for {intent.value}: {', '.join(unknown)}")
+        product = request.parameters.get("productName")
+        if not isinstance(product, str) or not product.strip():
+            raise WorkflowError("productName is required; productId and query text are not used to guess a product")
+        from math import isfinite
+        for key, value in request.parameters.items():
+            if key in {"productName", "weather"}:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value):
+                raise WorkflowError(f"{key} must be a finite number")
+            if key != "priceElasticity" and value < 0:
+                raise WorkflowError(f"{key} cannot be negative")
+            if key in {"forecastDays", "shelfLifeDays"} and (value < 1 or value != int(value)):
+                raise WorkflowError(f"{key} must be a positive integer")
+            if key == "wasteRate" and value >= 1:
+                raise WorkflowError("wasteRate must be less than one")
         return {"intent": intent}
 
-    async def _authorize(self, state: dict[str, Any]) -> dict[str, Any]:
+    async def _authorize(self, state: DecisionState) -> dict[str, Any]:
         identity: IdentityContext = state["identity"]
         intent: Intent = state["intent"]
         sensitive = {Intent.PURCHASE_ADVICE: "agent:purchase", Intent.SUPPLIER_MATCH: "agent:supplier"}
@@ -133,7 +166,7 @@ class DecisionWorkflow:
             raise PermissionDenied(f"{required} permission required for {intent.value}")
         return {}
 
-    async def _fetch_context(self, state: dict[str, Any]) -> dict[str, Any]:
+    async def _fetch_context(self, state: DecisionState) -> dict[str, Any]:
         request: DecisionRequest = state["request"]
         try:
             context = await self.java_client.fetch_decision_context(
@@ -149,17 +182,14 @@ class DecisionWorkflow:
                 raise
             return {"context": build_demo_context(request.parameters), "demo": True}
 
-    async def _analyze(self, state: dict[str, Any]) -> dict[str, Any]:
+    async def _analyze(self, state: DecisionState) -> dict[str, Any]:
         intent: Intent = state["intent"]
         analyzer = ANALYZERS[intent]
         return {"analysis": analyzer(state["context"], state["demo"])}
 
-    async def _finalize(self, state: dict[str, Any]) -> dict[str, Any]:
+    async def _finalize(self, state: DecisionState) -> dict[str, Any]:
         analysis = dict(state["analysis"])
-        purchase_amount = analysis.pop("purchase_amount", 0.0)
-        requires_confirmation = bool(analysis["requires_human_confirmation"])
-        if purchase_amount >= self.settings.human_confirmation_purchase_amount:
-            requires_confirmation = True
+        analysis.pop("purchase_amount", None)
         output = DecisionOutput(
             intent=state["intent"],
             recommendation=analysis["recommendation"],
@@ -167,9 +197,9 @@ class DecisionWorkflow:
             calculations=analysis["calculations"],
             risks=analysis["risks"],
             confidence=analysis["confidence"],
-            requires_human_confirmation=requires_confirmation,
+            requires_human_confirmation=True,
             trace_id=state["trace_id"],
-            data_mode="test_demo_fallback" if state["demo"] else "live",
+            data_mode="test_demo_fallback" if state["demo"] else ("insufficient_data" if analysis["confidence"] == 0 else "live"),
             loop_markers=state["loop_markers"],
         )
         return {"output": output}

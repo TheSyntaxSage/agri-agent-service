@@ -41,4 +41,3 @@ def build_demo_context(parameters: dict[str, Any]) -> dict[str, Any]:
     }
     context.update(parameters)
     return context
-

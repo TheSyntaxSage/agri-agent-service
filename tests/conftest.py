@@ -22,10 +22,10 @@ class FakeJavaClient:
 
 
 @pytest.fixture
-def settings(tmp_path) -> Settings:
+def settings() -> Settings:
     return Settings(
         app_env="test",
-        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        database_url="sqlite:///:memory:",
         java_base_url="http://java.invalid",
         java_service_token="test-service-token",
         allow_test_demo_fallback=True,
@@ -47,9 +47,9 @@ def client(settings: Settings, fake_java: FakeJavaClient) -> Iterator[TestClient
 @pytest.fixture
 def auth_headers() -> dict[str, str]:
     return {
+        "X-Service-Token": "test-service-token",
         "X-Tenant-Id": "tenant-1",
         "X-User-Id": "user-1",
         "X-Roles": "manager",
         "X-Permissions": "agent:decide,agent:purchase,agent:supplier",
     }
-
